@@ -1,0 +1,172 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{bm}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\newcommand{\softmax}{\operatorname{softmax}}
+
+\title{Decoder-Only Transformers in Einstein Notation}
+\author{Valentin A.}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Conventions and Einstein Primer}
+We use Einstein summation: an index repeated once up and once down in a term is summed. \textbf{Temporal indices $t,s,u$ are never implicitly summed}; we write $\sum$ or $\softmax_s(\cdot)$ explicitly. Kronecker deltas always pair one up with one down. We use the trivial metric $\delta$ to raise/lower indices only when needed; e.g. $a_k := a^m\,\delta_{m k}$.
+
+\paragraph{Index sets.} $t,s\in\{1..T\}$ (time), $u\in\{1..U\}$ (encoder), $r\in\{1..R\}$ (request id), $f\in\{1..d_{\mathrm{model}}\}$, $h\in\{1..H\}$, $d,k\in\{1..d_k\}$, $e\in\{1..d_{\mathrm{ff}}\}$, $\rho\in\{1..r\}$ (latent for MLA), $x\in\{1..E\}$ (experts), $v\in\{1..V\}$ (vocab).
+
+\section{Pre-Norm Decoder Block}
+Let $X_t{}^{f}$ be token embeddings. One layer (pre-norm): $\widetilde H_t{}^{f}=\mathrm{LN}(H_t{}^{f})$; self-attention produces $A_t{}^{f}$; residual $H'_t{}^{f}=H_t{}^{f}+A_t{}^{f}$; then $\mathrm{LN}$, FFN:
+\[
+U_t{}^{e}=H''_t{}^{f} W_{1\,f}{}^{e},\quad
+Z_t{}^{e}=\sigma(U_t{}^{e}),\quad
+F_t{}^{f}=Z_t{}^{e} W_{2\,e}{}^{f},\quad
+H^{\mathrm{out}}_t{}^{f}=H'_t{}^{f}+F_t{}^{f}.
+\]
+
+\subsection{Multi-Head Self-Attention}
+Projections for head $h$:
+\[
+Q_{t h}{}^{d}=\widetilde H_t{}^{f} W_{Q\,h\,f}{}^{d},\quad
+K_{s h}{}^{d}=\widetilde H_s{}^{f} W_{K\,h\,f}{}^{d},\quad
+V_{s h}{}^{d}=\widetilde H_s{}^{f} W_{V\,h\,f}{}^{d}.
+\]
+RoPE rotation matrices have indices \emph{exactly} $R_{t}{}_{d}{}^{k}$ so that
+\[
+\widehat Q_{t h}{}^{k}=Q_{t h}{}^{d}\, R_{t}{}_{d}{}^{k},\qquad
+\widehat K_{s h}{}^{k}=K_{s h}{}^{d}\, R_{s}{}_{d}{}^{k},
+\]
+(no implicit sums over $t$ or $s$). Causal logits (we lower $\widehat K$ using $\delta$; no implicit sum over $s$):
+\[
+L_{t s}^{(h)}=\frac{1}{\sqrt{d_k}}\; \widehat Q_{t h}{}^{k}\, \widehat K_{s h k},\qquad \text{with } \widehat K_{s h k}:=\widehat K_{s h}{}^{m}\,\delta_{m k}.
+\]
+Masked to $s\le t$. With ALiBi, add $-m_h (t-s)$ inside the softmax. Weights:
+\[
+A_{t s}^{(h)}=\softmax_{s}\big(L_{t s}^{(h)}\big).
+\]
+Head output and merge:
+\[
+Y_{t h}{}^{d}=\sum_{s\le t} A_{t s}^{(h)} V_{s h}{}^{d},\qquad
+A_t{}^{f}=Y_{t h}{}^{d} W_{O\,h\,d}{}^{f}.
+\]
+
+\section{Positional Schemes}
+\subsection{RoPE (post-projection)}
+As above, RoPE uses $R_{t}{}_{d}{}^{k}$, yielding a dot-product depending on $(t-s)$ via relative phase.
+
+\subsection{ALiBi (score bias)}
+Add per-head linear bias:
+\[
+A_{t s}^{(h)}=\softmax_{s}\!\left(\frac{1}{\sqrt{d_k}}\,Q_{t h}{}^{d}K_{s h d}-m_h (t-s)\right),\quad s\le t.
+\]
+
+\section{KV Caching and Long Context}
+\subsection{KV Cache}
+At step $t$, reuse cached $K_{s h}{}^{d},V_{s h}{}^{d}$ for $s<t$; compute only $Q_{t h}{}^{d}$ (and $K_{t},V_{t}$) and append.
+
+\subsection{RoPE in cache: store rotated vs unrotated}
+Option A: store $\widehat K_{s h}{}^{k}$ and use $\widehat Q_{t h}{}^{k}$ directly.
+Option B: store unrotated $K_{s h}{}^{d}$ and rotate on-the-fly: $\widehat K_{s h}{}^{k}=K_{s h}{}^{d}R_{s}{}_{d}{}^{k}$ (flexible for scaling, more compute).
+
+\subsection{Paged attention}
+Partition $\{1..t\}$ into pages of size $P$; attend within page (or with small overlap). Mask equivalent: $L_{t s}=-\infty$ if $s$ outside $t$'s page window.
+
+\subsection{Sliding window}
+Restrict to $s\in (t-W, \ldots, t]$ by masking $s<t-W$. Drop old cache entries beyond window if desired.
+
+\subsection{Continuous batching (request index)}
+Use $\delta_{r}{}^{r'}$ to prevent cross-request attention:
+\[
+L_{r t,\, r' s}^{(h)}=\frac{1}{\sqrt{d_k}}\, Q_{r t h}{}^{d} K_{r' s h d}\, \delta_{r}{}^{r'}.
+\]
+Then $Y_{r t h}{}^{d}=\sum_{s} A_{r t,\, r s}^{(h)} V_{r s h}{}^{d}$.
+
+\section{FlashAttention: Exact Tiled Online-Softmax}
+For fixed $(t,h)$, iterate blocks $B$ over $s$. Maintain running max $m_{t}^{(h)}$, partition $z_{t}^{(h)}$, and numerator $N_{t h}{}^{d}$.
+
+Initialize: $m=-\infty$, $z=0$, $N_{t h}{}^{d}=0$.
+
+For a block $B\subseteq\{s\le t\}$, define per-$s$ logits
+$\ell_s=\tfrac{1}{\sqrt{d_k}}\widehat Q_{t h}{}^{k}\widehat K_{s h k}+b_{t s}^{(h)}$ (bias includes mask/ALiBi if any; no implicit sum over $s$). Let $m_B=\max_{s\in B}\ell_s$ and $m'=\max(m,m_B)$. Then
+\[
+\alpha=\exp(m-m'),\qquad
+z\leftarrow \alpha\, z + \sum_{s\in B}\exp(\ell_s-m'),\qquad
+N_{t h}{}^{d}\leftarrow \alpha\, N_{t h}{}^{d} + \sum_{s\in B}\exp(\ell_s-m')\, V_{s h}{}^{d},\qquad
+m\leftarrow m'.
+\]
+After all blocks, exact output:
+\[
+Y_{t h}{}^{d}=\frac{N_{t h}{}^{d}}{z}.
+\]
+This is numerically equivalent to full softmax but never materializes the $t\times t$ matrix.
+
+\section{GQA, MLA, MoE, MTP}
+\subsection{Grouped-Query Attention (GQA)}
+Let $g\in\{1..G\}$ index KV groups ($G<H$). Queries use $h$, K/V use $g$, with a mapping $\pi(h)$:
+\[
+L_{t s}^{(h)}=\tfrac{1}{\sqrt{d_k}}\, Q_{t h}{}^{d} K_{s,\,\pi(h)}{}_{d},\qquad
+Y_{t h}{}^{d}=\sum_{s\le t} A_{t s}^{(h)} V_{s,\,\pi(h)}{}^{d}.
+\]
+
+\subsection{Multi-Head Latent Attention (MLA)}
+Compress to latent $L_s{}^{\rho}=\widetilde H_s{}^{f} U_{f}{}^{\rho}$, then per-head expand:
+\[
+K_{s h}{}^{d}=L_s{}^{\rho} P_{h\,\rho}{}^{d},\qquad
+V_{s h}{}^{d}=L_s{}^{\rho} Q_{h\,\rho}{}^{d}.
+\]
+Logits become $\tfrac{1}{\sqrt{d_k}}\, q_{t h}{}^{\rho} L_s{}^{\rho}$ with $q_{t h}{}^{\rho}=Q_{t h}{}^{d} P_{h\,\rho\,d}$; the weighted latent $z_{t h}{}^{\rho}=\sum_{s\le t}A_{t s}^{(h)}L_s{}^{\rho}$; output $Y_{t h}{}^{d}=z_{t h}{}^{\rho} Q_{h\,\rho}{}^{d}$.
+
+\subsection{MoE with learned router bias}
+Router logits: $G_t{}^{x}=H''_t{}^{f} W_{\mathrm{gate}\,f}{}^{x}+b^{x}$; choose top-$k$ experts $\{x_i\}$ and weights $p_{t x_i}=\frac{e^{G_t{}^{x_i}}}{\sum_j e^{G_t{}^{x_j}}}$. Output $F_t{}^{f}=\sum_i p_{t x_i}\, F_{(x_i),t}{}^{f}$.
+
+\subsection{Multi-Token Prediction (MTP)}
+Add $n$ vocab heads:
+\[
+O^{(j)}_{t}{}^{v}=H^{\mathrm{final}}_{t}{}^{f} W_{O_j\,f}{}^{v},\quad
+\mathcal{L}=\frac{1}{n}\sum_{j=1}^{n}\mathrm{CE}\big(O^{(j)}_{t},\, w_{t+j}\big).
+\]
+
+\section{FP8 Mixed Precision and Pipeline Overlap}
+FP8 for matmuls with per-tensor scales; keep reductions (LayerNorm/softmax sums) higher precision. Pipeline: split layers across devices; overlap micro-batches to minimize bubble; recompute or checkpoint as needed.
+
+\section{YaRN-Style RoPE Scaling}
+For extension from $L$ to $L'$, scale angles per dimension: $\theta'_{d}(t)=\theta_{d}(t/\alpha)$ (static, $\alpha=L'/L$), or dynamic scale increasing with current length. Use $\tilde R_{t}{}_{d}{}^{k}$ in place of $R_{t}{}_{d}{}^{k}$. \textbf{Cache note:} if scale changes mid-generation, keep \emph{unrotated} $K_{s h}{}^{d}$ to re-rotate with new $\tilde R_{s}$.
+
+\section{Lemma: Single Bilinear Collapse and Why RoPE/ALiBi Break It}
+\textbf{Lemma.} Without positional terms, if $W_Q^{(h)} (W_K^{(h)})^{\top}=M$ (same $M$ for all $h$), then all heads share logits
+$L_{t s}^{(h)}=X_t{}^{f} M_{f g} X_s{}^{g}$ and the layer equals a single-head with attention weights from $M$ and a combined value-projection $U_{g}{}^{f}=\sum_h W_{V\,g}^{(h)\,d} W_{O\,h\,d}{}^{f}$.
+
+\textbf{RoPE counterexample.} Effective bilinear becomes $M^{(h)}(t,s)=W_Q^{(h)} R_{t}^{\top} R_{s} (W_K^{(h)})^{\top}$ (depends on $t,s$). No single global $M$ matches all $(t,s)$.
+
+\textbf{ALiBi counterexample.} Head-specific slopes $m_h$ yield $L_{t s}^{(h)}=X_t{}^{f} M_{f g} X_s{}^{g}-m_h (t-s)$; differing $m_h$ produce genuinely different $A^{(h)}$.
+
+\section{Index Sanity Checklist}
+\begin{itemize}
+\item Every contraction pairs one up with one down (e.g.\ $Q_{t h}{}^{d}K_{s h d}$).
+\item Temporal indices $t,s,u$ are never implicitly summed; sums and $\softmax_s$ are explicit.
+\item RoPE matrices use \emph{exact} indices $R_{t}{}_{d}{}^{k}$; $\widehat Q_{t h}{}^{k}=Q_{t h}{}^{d} R_{t}{}_{d}{}^{k}$ and similarly for $\widehat K$.
+\item $\delta$ usage: $\delta_{r}{}^{r'}$ (one up, one down) gates cross-request terms; we also lower $\widehat K$ via $\delta$ in dot-products.
+\item Shapes check: $A_t{}^{f}=Y_{t h}{}^{d} W_{O\,h\,d}{}^{f}$ sums $(h,d)$ to return $f$.
+\end{itemize}
+
+\appendix
+\section*{Appendix: Cross-Attention (Encoder--Decoder)}
+Encoder states $E_{u}{}^{f}$; cross-attn queries from decoder $\widetilde H_t{}^{f}$:
+\[
+Q^{\mathrm{x}}_{t h}{}^{d}=\widetilde H_t{}^{f} W^{\mathrm{x}}_{Q\,h\,f}{}^{d},\quad
+K^{\mathrm{x}}_{u h}{}^{d}=E_{u}{}^{f} W^{\mathrm{x}}_{K\,h\,f}{}^{d},\quad
+V^{\mathrm{x}}_{u h}{}^{d}=E_{u}{}^{f} W^{\mathrm{x}}_{V\,h\,f}{}^{d}.
+\]
+Optionally apply RoPE on ($t,u$) with $R_{t}{}_{d}{}^{k}, R_{u}{}_{d}{}^{k}$, then
+\[
+L^{\mathrm{x}(h)}_{t u}=\tfrac{1}{\sqrt{d_k}}\, \widehat Q^{\mathrm{x}}_{t h}{}^{k}\widehat K^{\mathrm{x}}_{u h k},\quad
+A^{\mathrm{x}(h)}_{t u}=\softmax_{u}(L^{\mathrm{x}(h)}_{t u}),\quad
+Y^{\mathrm{x}}_{t h}{}^{d}=\sum_{u} A^{\mathrm{x}(h)}_{t u} V^{\mathrm{x}}_{u h}{}^{d}.
+\]
+Finally merge heads with $W_O^{\mathrm{x}}$ and add as a sublayer (pre-norm as usual).
+\end{document}
