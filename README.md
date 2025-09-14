@@ -134,7 +134,7 @@ rm *.aux *.log *.out
 
 ---
 
-## 📖 Main Content
+## 📖 
 
 ### Conventions and Einstein Primer
 
